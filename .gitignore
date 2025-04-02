@@ -1,0 +1,44 @@
+# Python cache files and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak
+venv.bak
+
+# Environment variables file
+.env
+
+# Docker Compose override file (optional)
+docker-compose.override.yml
+
+# Persistent data directories (relative to docker-compose.yml)
+# Adjust if you named your state directory differently
+data/
+# Old input directory, if it still exists locally
+bank_input/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Log files (if any are generated locally)
+*.log

@@ -1,0 +1,3 @@
+python-telegram-bot[ext]>=20.0  # Usamos la versión 20+ que es async
+httpx[http2] # Dependencia a menudo necesaria
+requests
