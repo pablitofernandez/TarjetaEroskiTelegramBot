@@ -289,7 +289,7 @@ def process_excel_file(filepath: Path, original_filename: str) -> dict:
             continue
         try:
             if not check_if_id_exists(DB_FILE_PATH, tx_id):
-                fecha_dt = pd.to_datetime(row[COL_DATE_EXCEL], errors='coerce')
+                fecha_dt = pd.to_datetime(row[COL_DATE_EXCEL],format='%d/%m/%Y', errors='coerce')
                 if pd.isna(fecha_dt):
                     logger.warning(f"Fecha inválida fila {index + EXCEL_SKIP_ROWS + 2} en '{original_filename}'.")
                     failed_rows_count += 1; continue
