@@ -27,7 +27,7 @@ jobs:
 
     - name: Build and Push bank-processor Image
       run: |
-        IMAGE_TAG_BASE="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/tarjeta-eroski-processor"
+        IMAGE_TAG_BASE="ghcr.io/${{ github.repository_owner }}/tarjetaeroskitelegrambot/tarjeta-eroski-processor"
         docker build . --file Dockerfile --tag ${IMAGE_TAG_BASE}:latest --tag ${IMAGE_TAG_BASE}:${{ github.sha }}
         if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
           echo "Pushing bank-processor image to GHCR..."
@@ -39,7 +39,7 @@ jobs:
 
     - name: Build and Push telegram-bot Image
       run: |
-        IMAGE_TAG_BASE="ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/tarjeta-eroski-telegram-bot"
+        IMAGE_TAG_BASE="ghcr.io/${{ github.repository_owner }}/tarjetaeroskitelegrambot/tarjeta-eroski-telegram-bot"
         docker build ./telegram_bot --file ./telegram_bot/Dockerfile --tag ${IMAGE_TAG_BASE}:latest --tag ${IMAGE_TAG_BASE}:${{ github.sha }}
         if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
           echo "Pushing telegram-bot image to GHCR..."
