@@ -6,7 +6,7 @@ services:
     container_name: bank-processor
     restart: unless-stopped
     volumes:
-      - ../data/state:/app/state
+      - ./data/state:/app/state
     environment:
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}
@@ -23,6 +23,8 @@ services:
       - COL_BANK_ID_EXCEL=${COL_BANK_ID_EXCEL}
       - TZ=Europe/Madrid
       - API_PORT=${API_PORT:-5001}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.6} # Umbral más bajo para preguntar
+      - DATE_WINDOW_DAYS=${DATE_WINDOW_DAYS:-3}
     env_file:
       - .env
 
