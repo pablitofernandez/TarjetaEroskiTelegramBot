@@ -5,192 +5,159 @@ from pathlib import Path
 import logging
 import tempfile
 from werkzeug.utils import secure_filename
-from datetime import datetime # Importar datetime
+from datetime import datetime
+from typing import Optional # Importar Optional si usas type hints
 
-# Importar funciones necesarias del módulo de lógica
-from process_bank_excel import process_excel_file, insert_transaction, check_if_id_exists, DB_FILE_PATH, COL_DB_ID # Añadir DB_FILE_PATH, COL_DB_ID
+# Importar funciones y constantes necesarias de la lógica
+from process_bank_excel import (
+    process_excel_file, insert_transaction, check_if_id_exists,
+    log_discarded_duplicate, # Importar la nueva función
+    DB_FILE_PATH, COL_DB_ID, COL_DB_DATE, COL_DB_DESC, COL_DB_AMOUNT,
+    COL_DB_PROCESSED_AT, COL_DB_CATEGORY
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("APIServer")
 
-# --- Constantes y Configuración (igual que antes) ---
-# DB_FILE_PATH ahora se importa
-COL_DB_DATE = "transaction_date"
-COL_DB_DESC = "description"
-COL_DB_AMOUNT = "amount"
-COL_DB_PROCESSED_AT = "processed_at"
-COL_DB_CATEGORY = "category" # Añadido por si insert_transaction lo necesita
-
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 # 16 MB max upload
 
-# --- Funciones DB (get_db_connection igual) ---
+# --- Funciones DB ---
 def get_db_connection():
+    """Establece conexión con la BD SQLite."""
     try:
-        conn = sqlite3.connect(DB_FILE_PATH, check_same_thread=False) # check_same_thread=False requiere cuidado
-        conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(DB_FILE_PATH, check_same_thread=False, timeout=10.0)
+        conn.row_factory = sqlite3.Row # Acceso a columnas por nombre
         return conn
     except sqlite3.Error as e:
-        logger.error(f"Error al conectar a la base de datos {DB_FILE_PATH}: {e}")
+        logger.error(f"Error conectando a DB {DB_FILE_PATH}: {e}")
         return None
 
-# --- Endpoints Existentes (get_last_transactions, handle_process_excel, health_check sin cambios funcionales clave) ---
+# --- Endpoints ---
 @app.route('/api/last_transactions', methods=['GET'])
 def get_last_transactions():
-    # ... (sin cambios) ...
-    logger.info(f"Request GET /api/last_transactions desde {request.remote_addr}")
+    """Devuelve las últimas N transacciones."""
+    logger.info(f"GET /api/last_transactions from {request.remote_addr}")
     try: count = int(request.args.get('count', 5)); assert 1 <= count <= 100
     except: count = 5
 
     conn = get_db_connection()
-    if not conn: return jsonify({"error": "Error al conectar a la base de datos"}), 500
-
+    if not conn: return jsonify({"error": "DB Connection Error"}), 500
     transactions = []
     try:
         cursor = conn.cursor()
         query = f"SELECT {COL_DB_DATE}, {COL_DB_DESC}, {COL_DB_AMOUNT} FROM transactions ORDER BY {COL_DB_DATE} DESC, {COL_DB_PROCESSED_AT} DESC LIMIT ?"
         cursor.execute(query, (count,))
         transactions = [dict(row) for row in cursor.fetchall()]
-        logger.info(f"Devolviendo {len(transactions)} transacciones.")
     except sqlite3.Error as e:
         logger.error(f"Error BD en last_transactions: {e}")
-        return jsonify({"error": "Error al consultar las transacciones"}), 500
+        return jsonify({"error": "Error consultando DB"}), 500
     finally:
         if conn: conn.close()
     return jsonify(transactions)
 
-
 @app.route('/api/process_excel', methods=['POST'])
 def handle_process_excel():
-    # ... (validaciones iniciales de archivo igual) ...
-    logger.info(f"Request POST /api/process_excel desde {request.remote_addr}")
-    if 'excel_file' not in request.files: return jsonify({"status": "error", "message": "No se encontró el archivo ('excel_file')."}), 400
+    """Recibe, guarda temporalmente y procesa un archivo Excel."""
+    logger.info(f"POST /api/process_excel from {request.remote_addr}")
+    if 'excel_file' not in request.files: return jsonify({"status": "error", "message": "'excel_file' no encontrado."}), 400
     file = request.files['excel_file']
-    if file.filename == '': return jsonify({"status": "error", "message": "Nombre de archivo vacío."}), 400
+    if not file.filename: return jsonify({"status": "error", "message": "Nombre archivo vacío."}), 400
 
     original_filename = secure_filename(file.filename)
-    logger.info(f"Archivo recibido: {original_filename}")
-    allowed_extensions = {'.xlsx', '.xls'}; file_ext = Path(original_filename).suffix.lower()
-    if file_ext not in allowed_extensions:
-         logger.warning(f"Extensión no permitida: {file_ext}")
-         return jsonify({"status": "error", "message": f"Tipo archivo no permitido: {file_ext}. Solo {allowed_extensions}"}), 400
+    allowed = {'.xlsx', '.xls'}; file_ext = Path(original_filename).suffix.lower()
+    if file_ext not in allowed: return jsonify({"status": "error", "message": f"Tipo no permitido: {file_ext}. Solo {allowed}"}), 400
 
-    temp_dir = None
     try:
         with tempfile.TemporaryDirectory() as temp_dir_name:
-            temp_dir = Path(temp_dir_name) # Para logging
-            temp_filepath = temp_dir / original_filename
+            temp_filepath = Path(temp_dir_name) / original_filename
             file.save(temp_filepath)
-            logger.info(f"Archivo guardado temporalmente en: {temp_filepath}")
+            logger.info(f"Archivo temporal: {temp_filepath}")
+            result = process_excel_file(temp_filepath, original_filename) # Llamada a la lógica
 
-            # Llamada a la lógica de procesamiento (ahora devuelve estructura diferente)
-            result = process_excel_file(temp_filepath, original_filename)
+            status = result.get('status', 'error')
+            http_status = 200 # Default OK para success, warning, confirmation_required
+            if status == 'error': http_status = 500
+            if "Faltan columnas" in result.get('message', '') or "leer Excel" in result.get('message', ''): http_status = 400
 
-            # Determinar HTTP status basado en el nuevo 'status'
-            http_status = 500 # Default a error
-            api_status = result.get('status', 'error')
-
-            if api_status == 'success': http_status = 200
-            elif api_status == 'warning': http_status = 200
-            elif api_status == 'confirmation_required': http_status = 200 # OK, pero requiere acción
-            elif api_status == 'error':
-                # Mantener lógica de 400 para errores de formato/columnas si es posible
-                if "Faltan columnas" in result.get('message', '') or "leer Excel" in result.get('message', ''):
-                     http_status = 400
-                else: # Otros errores son 500
-                     http_status = 500
-
-            logger.info(f"Procesamiento para {original_filename} completado con status API: '{api_status}'. Devolviendo HTTP {http_status}.")
-            # Devolver el resultado completo, incluyendo 'pending_confirmation' si existe
+            logger.info(f"Resultado para {original_filename}: Status API='{status}', HTTP={http_status}")
             return jsonify(result), http_status
+    except Exception as e:
+        logger.error(f"Error inesperado en /api/process_excel para {original_filename}: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": "Error interno servidor."}), 500
+
+@app.route('/api/confirm_transaction', methods=['POST'])
+def handle_confirm_transaction():
+    """Recibe la decisión del usuario (insert/discard) y actúa en consecuencia."""
+    logger.info(f"POST /api/confirm_transaction from {request.remote_addr}")
+    try:
+        data = request.get_json()
+        if not data: return jsonify({"status": "error", "message": "Request body vacío/inválido."}), 400
+
+        tx_id = data.get('transaction_id') # ID de la transacción nueva/pendiente
+        action = data.get('action')
+        details = data.get('details') # Detalles de la tx nueva (para 'insert')
+        existing_tx_id = data.get('existing_tx_id') # ID de la tx existente (para 'discard')
+
+        logger.info(f"Confirmación: ID={tx_id}, Acción={action}, ExistingID={existing_tx_id}")
+
+        if not tx_id or action not in ['insert', 'discard']:
+            return jsonify({"status": "error", "message": "Datos confirmación inválidos (tx_id/action)."}), 400
+        if action == 'insert' and not details:
+            return jsonify({"status": "error", "message": "Faltan 'details' para 'insert'."}), 400
+        if action == 'discard' and not existing_tx_id:
+            return jsonify({"status": "error", "message": "Falta 'existing_tx_id' para 'discard'."}), 400
+
+        if action == 'insert':
+            # Revalidar detalles básicos
+            required_keys = {'date_db', 'desc', 'amount'}
+            if not required_keys.issubset(details.keys()):
+                 return jsonify({"status": "error", "message": "Datos 'details' incompletos."}), 400
+            # Re-chequear existencia por si acaso (concurrencia)
+            if check_if_id_exists(DB_FILE_PATH, tx_id):
+                 logger.warning(f"Confirmación 'insert' para {tx_id}, pero ya existe. Ignorando.")
+                 return jsonify({"status": "ok", "message": f"Transacción {tx_id[:8]}... ya existía."}), 200
+            # Construir datos y intentar insertar
+            tx_data = {
+                COL_DB_ID: tx_id, COL_DB_DATE: details['date_db'], COL_DB_DESC: details['desc'],
+                COL_DB_AMOUNT: details['amount'], COL_DB_PROCESSED_AT: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                COL_DB_CATEGORY: details.get(COL_DB_CATEGORY)
+            }
+            if insert_transaction(DB_FILE_PATH, tx_data):
+                logger.info(f"Transacción {tx_id} insertada por confirmación.")
+                # Considerar enviar email de confirmados individuales aquí?
+                return jsonify({"status": "ok", "message": f"Transacción {tx_id[:8]}... insertada."}), 200
+            else:
+                logger.error(f"Error insertando {tx_id} tras confirmación.")
+                return jsonify({"status": "error", "message": f"Error BD insertando {tx_id[:8]}..."}), 500
+
+        elif action == 'discard':
+            # Registrar el descarte en la tabla 'discarded_log'
+            if log_discarded_duplicate(DB_FILE_PATH, tx_id, existing_tx_id):
+                logger.info(f"Transacción {tx_id} registrada en discarded_log.")
+            else:
+                logger.error(f"Fallo registrando descarte de {tx_id} en discarded_log.")
+                # No devolver error al bot, la decisión de descartar ya está tomada
+            return jsonify({"status": "ok", "message": f"Transacción {tx_id[:8]}... descartada."}), 200
 
     except Exception as e:
-        logger.error(f"Error inesperado en endpoint /api/process_excel para {original_filename}: {e}", exc_info=True)
-        return jsonify({"status": "error", "message": "Error interno inesperado en el servidor."}), 500
-    # No necesitamos finally para temp_dir.cleanup() si usamos 'with'
+        logger.error(f"Error inesperado en /api/confirm_transaction: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": "Error interno servidor."}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    # ... (sin cambios) ...
-     logger.debug(f"Health check solicitado desde {request.remote_addr}")
+     """Verifica la conectividad con la base de datos."""
+     logger.debug(f"GET /health from {request.remote_addr}")
      conn = None
      try:
           conn = get_db_connection(); conn.close()
           return jsonify({"status": "ok", "db_connection": True}), 200
      except Exception as e:
-          logger.warning(f"Health check falló al verificar DB: {e}")
-          # Devolver 503 Service Unavailable si la BD falla
+          logger.warning(f"Health check falló: {e}")
           return jsonify({"status": "error", "db_connection": False, "message": str(e)}), 503
 
-# --- NUEVO ENDPOINT PARA CONFIRMACIÓN ---
-@app.route('/api/confirm_transaction', methods=['POST'])
-def handle_confirm_transaction():
-    """Recibe la decisión del usuario (vía bot) para una transacción pendiente."""
-    logger.info(f"Request POST /api/confirm_transaction desde {request.remote_addr}")
-
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "error", "message": "Request body vacío o no es JSON."}), 400
-
-        tx_id = data.get('transaction_id')
-        action = data.get('action')
-        details = data.get('details') # Detalles de la transacción NUEVA
-
-        logger.info(f"Confirmación recibida: ID={tx_id}, Acción={action}")
-
-        # Validaciones
-        if not tx_id or not action or action not in ['insert', 'discard']:
-            logger.warning(f"Datos de confirmación inválidos: {data}")
-            return jsonify({"status": "error", "message": "Faltan 'transaction_id' o 'action' (insert/discard) inválida."}), 400
-        if action == 'insert' and not details:
-            logger.warning(f"Faltan 'details' para acción 'insert': {data}")
-            return jsonify({"status": "error", "message": "Faltan 'details' para la acción 'insert'."}), 400
-
-        # Procesar acción
-        if action == 'insert':
-            # Reconstruir el diccionario de datos necesario para insert_transaction
-            # Usar los 'details' enviados por el bot
-            required_keys = {'date_db', 'desc', 'amount'}
-            if not required_keys.issubset(details.keys()):
-                 logger.error(f"Faltan detalles clave en 'details' para insertar {tx_id}")
-                 return jsonify({"status": "error", "message": "Datos incompletos en 'details' para insertar."}), 400
-
-            # Comprobar de nuevo si ya existe (por si acaso hubo concurrencia o doble click)
-            if check_if_id_exists(DB_FILE_PATH, tx_id):
-                 logger.warning(f"Confirmación 'insert' para {tx_id}, pero ya existe. Ignorando.")
-                 return jsonify({"status": "ok", "message": f"Transacción {tx_id} ya existía, no se re-insertó."}), 200
-
-            tx_data = {
-                COL_DB_ID: tx_id,
-                COL_DB_DATE: details['date_db'],
-                COL_DB_DESC: details['desc'],
-                COL_DB_AMOUNT: details['amount'],
-                COL_DB_PROCESSED_AT: datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # Usar hora actual de confirmación
-                COL_DB_CATEGORY: details.get(COL_DB_CATEGORY) # Incluir si existe en details
-            }
-
-            if insert_transaction(DB_FILE_PATH, tx_data):
-                logger.info(f"Transacción {tx_id} insertada por confirmación del usuario.")
-                # Considerar enviar email aquí para las confirmadas? O al final?
-                return jsonify({"status": "ok", "message": f"Transacción {tx_id} insertada."}), 200
-            else:
-                logger.error(f"Error al insertar transacción {tx_id} tras confirmación.")
-                return jsonify({"status": "error", "message": f"Error al insertar transacción {tx_id} en BD."}), 500
-
-        elif action == 'discard':
-            logger.info(f"Transacción {tx_id} descartada por confirmación del usuario.")
-            # Opcional: Guardar log de descartados en otro sitio si se necesita auditoría
-            return jsonify({"status": "ok", "message": f"Transacción {tx_id} descartada."}), 200
-
-    except Exception as e:
-        logger.error(f"Error inesperado en /api/confirm_transaction: {e}", exc_info=True)
-        return jsonify({"status": "error", "message": "Error interno inesperado en el servidor."}), 500
-
-
-# --- Inicio de la Aplicación ---
+# --- Inicio App ---
 if __name__ == "__main__":
     api_port = int(os.environ.get('API_PORT', 5001))
-    logger.info(f"Iniciando servidor API Flask en 0.0.0.0:{api_port}")
-    # debug=False es importante para producción
-    app.run(host='0.0.0.0', port=api_port, debug=False)
+    logger.info(f"Iniciando API Server en 0.0.0.0:{api_port}")
+    app.run(host='0.0.0.0', port=api_port, debug=False) # debug=False para producción
