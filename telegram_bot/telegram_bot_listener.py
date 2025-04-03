@@ -1,153 +1,275 @@
 import logging
 import os
-from pathlib import Path
 import requests
 import locale
 from datetime import datetime
 import io
+import json # Para codificar/decodificar datos en callback
+import html
 
-from telegram import Update, Document
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+# Importaciones de Telegram
+from telegram import Update, Document, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application, MessageHandler, CommandHandler, filters, ContextTypes,
+    CallbackQueryHandler # Importante para los botones
+)
+from telegram.constants import ParseMode # Para formato Markdown/HTML si se usa
 
+# --- Configuración (igual que antes) ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-try:
-    ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID"))
-except (TypeError, ValueError):
-    logging.critical("Error: ALLOWED_USER_ID no definido o inválido.")
-    exit(1)
+try: ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID"))
+except: logging.critical("Error: ALLOWED_USER_ID inválido."); exit(1)
 PROCESSOR_API_URL = os.environ.get('PROCESSOR_API_URL', 'http://bank-processor:5001/api')
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING) # Silenciar logs verbosos de httpx
 logger = logging.getLogger("TelegramBotListener")
-try:
-    locale.setlocale(locale.LC_ALL, 'es_ES.UTF-8')
-    logger.info("Locale 'es_ES.UTF-8' configurado.")
-except locale.Error:
-    logger.warning("Locale 'es_ES.UTF-8' no encontrado. Usando fallback 'C.UTF-8'.")
-    try: locale.setlocale(locale.LC_ALL, 'C.UTF-8')
-    except locale.Error: logger.error("No se pudo configurar ningún locale.")
 
-# --- Manejador de Documentos ---
+# Configurar locale para formato de moneda
+try: locale.setlocale(locale.LC_ALL, 'es_ES.UTF-8')
+except locale.Error: logger.warning("Locale 'es_ES.UTF-8' no encontrado, usando fallback."); locale.setlocale(locale.LC_ALL, '') # Usar default del sistema
+
+# --- Constantes para Callback Data ---
+CALLBACK_PREFIX_CONFIRM = "confirm"
+
+# --- Manejador de Documentos (MODIFICADO) ---
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Descarga archivo Excel a memoria y lo envía a la API de procesamiento."""
     chat_id = update.message.chat_id
     user = update.message.from_user
     logger.info(f"Documento recibido de User ID: {user.id} en Chat ID: {chat_id}")
 
-    # 1. Validaciones (Usuario, Documento, Extensión)
-    if user.id != ALLOWED_USER_ID:
-        logger.warning(f"Documento ignorado del usuario no autorizado: {user.id}")
-        await update.message.reply_text("Lo siento, no estoy autorizado a procesar archivos de ti.")
-        return
-    if not update.message.document:
-         logger.warning("El mensaje no contiene un documento.")
-         return # No responder nada
+    # 1. Validaciones (igual que antes)
+    if user.id != ALLOWED_USER_ID: await update.message.reply_text("No autorizado."); return
+    if not update.message.document: return
     document: Document = update.message.document
-    file_name = document.file_name
-    logger.info(f"Documento recibido: {file_name} (MIME type: {document.mime_type})")
+    file_name = document.file_name or "archivo_sin_nombre.bin" # Fallback nombre
+    logger.info(f"Documento: {file_name} (MIME: {document.mime_type})")
     allowed_extensions = ('.xlsx', '.xls')
     if not file_name.lower().endswith(allowed_extensions):
-        logger.warning(f"Tipo de archivo no permitido: {file_name}")
-        await update.message.reply_text(f"Lo siento, solo puedo procesar archivos Excel ({', '.join(allowed_extensions)}).")
-        return
+        await update.message.reply_text(f"Solo proceso archivos Excel ({', '.join(allowed_extensions)})."); return
 
-    # 2. Descargar archivo a memoria (BytesIO)
+    # 2. Descargar archivo a memoria (igual que antes)
+    processing_message = await update.message.reply_text(f"Recibido '{file_name}'. Descargando y enviando para procesar...")
+    file_content_stream = io.BytesIO()
     try:
-        # Mensaje inicial mientras se descarga y procesa
-        await update.message.reply_text(f"Recibido '{file_name}'. Procesando...")
-
         file_id = document.file_id
         new_file = await context.bot.get_file(file_id)
-
-        file_content_stream = io.BytesIO()
         await new_file.download_to_memory(file_content_stream)
-        file_content_stream.seek(0) # Rebobinar el stream para leerlo
-        logger.info(f"Archivo '{file_name}' descargado a memoria ({file_content_stream.getbuffer().nbytes} bytes).")
-
+        file_content_stream.seek(0)
+        logger.info(f"'{file_name}' descargado ({file_content_stream.getbuffer().nbytes} bytes).")
     except Exception as e:
-        logger.error(f"Error al descargar el archivo '{file_name}' a memoria: {e}", exc_info=True)
-        await update.message.reply_text(f"Ocurrió un error al descargar tu archivo '{file_name}'. Por favor, inténtalo de nuevo.")
-        return # Salir si la descarga falla
-
-    # 3. Enviar archivo a la API del procesador
-    api_endpoint = f"{PROCESSOR_API_URL}/process_excel"
-    files_to_send = {'excel_file': (file_name, file_content_stream, document.mime_type)}
-    feedback_message = f"❓ Hubo un problema procesando '{file_name}'. Inténtalo de nuevo o revisa los logs." # Mensaje por defecto
-
-    try:
-        logger.info(f"Enviando '{file_name}' a la API en {api_endpoint}...")
-        # Aumentar timeout si los archivos pueden ser grandes o el procesamiento lento
-        response = requests.post(api_endpoint, files=files_to_send, timeout=120) # Timeout de 2 minutos
-
-        # Chequear errores HTTP (4xx, 5xx)
-        response.raise_for_status()
-
-        # Procesar respuesta JSON exitosa (HTTP 200)
-        result = response.json()
-        logger.info(f"Respuesta recibida de la API para '{file_name}': {result}")
-
-        # Construir mensaje de feedback basado en la respuesta de la API
-        status = result.get('status', 'error')
-        message_from_api = result.get('message', 'Sin detalles.')
-
-        if status == 'success':
-            feedback_message = f"✅ {message_from_api}"
-        elif status == 'warning':
-             feedback_message = f"⚠️ {message_from_api}"
-        else: # status == 'error'
-             feedback_message = f"❌ Error procesando '{file_name}': {message_from_api}"
-
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout al enviar/procesar archivo '{file_name}' en la API ({api_endpoint}).")
-        feedback_message = f"⏳ El procesamiento de '{file_name}' tardó demasiado. Puede que se haya completado parcialmente. Revisa con /last o contacta al admin."
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error de conexión/HTTP al enviar '{file_name}' a la API: {e}", exc_info=False)
-        # Intentar obtener más detalles del error de la respuesta si existe
-        error_detail = ""
-        if e.response is not None:
-            try:
-                error_data = e.response.json()
-                error_detail = error_data.get("message", f"(Código: {e.response.status_code})")
-            except ValueError: # Si la respuesta no es JSON
-                error_detail = f"(Código: {e.response.status_code})"
-        else:
-             error_detail = "(Error de conexión)"
-
-        feedback_message = f"❌ No se pudo enviar '{file_name}' para procesar: {error_detail}"
-    except Exception as e:
-         # Capturar cualquier otro error inesperado
-         logger.error(f"Error inesperado durante el envío o manejo de respuesta para '{file_name}': {e}", exc_info=True)
-         feedback_message = f"🆘 Error inesperado procesando tu solicitud para '{file_name}'. Contacta al administrador."
-    finally:
-         # Limpiar el stream de memoria
-         file_content_stream.close()
-
-    # 4. Enviar feedback final al usuario
-    await update.message.reply_text(feedback_message)
-
-
-# --- Manejador /last ---
-async def show_last_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.message.from_user
-    chat_id = update.message.chat_id
-    logger.info(f"Comando /last recibido de User ID: {user.id} en Chat ID: {chat_id}. Args: {context.args}")
-
-    if user.id != ALLOWED_USER_ID:
-        logger.warning(f"/last ignorado del usuario no autorizado: {user.id}")
-        await update.message.reply_text("Lo siento, no tienes permiso para usar este comando.")
+        logger.error(f"Error descargando '{file_name}': {e}", exc_info=True)
+        await processing_message.edit_text(f"Error al descargar tu archivo '{file_name}'. Inténtalo de nuevo.")
         return
 
-    count = 5
-    if context.args:
+    # 3. Enviar archivo a la API (igual que antes, pero manejo de respuesta cambia)
+    api_endpoint = f"{PROCESSOR_API_URL}/process_excel"
+    files_to_send = {'excel_file': (file_name, file_content_stream, document.mime_type)}
+    api_result = None
+    http_status_code = None
+
+    try:
+        logger.info(f"Enviando '{file_name}' a {api_endpoint}...")
+        response = requests.post(api_endpoint, files=files_to_send, timeout=180) # Timeout más largo
+        http_status_code = response.status_code
+        response.raise_for_status() # Lanza excepción para 4xx/5xx
+        api_result = response.json()
+        logger.info(f"Respuesta API para '{file_name}' (HTTP {http_status_code}): {api_result}")
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout enviando/procesando '{file_name}' en API.")
+        await processing_message.edit_text(f"⏳ El procesamiento de '{file_name}' tardó demasiado. Revisa con /last o logs.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error conexión/HTTP ({http_status_code}) enviando '{file_name}': {e}", exc_info=False)
+        error_detail = f"(Código: {http_status_code})" if http_status_code else "(Error de conexión)"
+        if e.response is not None:
+             try: error_detail = e.response.json().get("message", error_detail)
+             except: pass # Ignorar si la respuesta de error no es JSON
+        await processing_message.edit_text(f"❌ No se pudo enviar '{file_name}': {error_detail}")
+    except Exception as e:
+         logger.error(f"Error inesperado enviando/procesando '{file_name}': {e}", exc_info=True)
+         await processing_message.edit_text(f"🆘 Error inesperado procesando '{file_name}'.")
+    finally:
+         file_content_stream.close() # Siempre cerrar el stream
+
+    # --- 4. Procesar Respuesta de la API y Enviar Feedback/Preguntas ---
+    if not api_result: return # Salir si no hubo respuesta válida de la API
+
+    status = api_result.get('status', 'error')
+    message_from_api = api_result.get('message', 'Sin detalles.')
+
+    if status == 'error':
+        await processing_message.edit_text(f"❌ Error procesando '{file_name}': {message_from_api}")
+    elif status == 'warning':
+        await processing_message.edit_text(f"⚠️ {message_from_api}")
+        # Podrías añadir un /last aquí si quieres mostrar las insertadas
+    elif status == 'success':
+         await processing_message.edit_text(f"✅ {message_from_api}")
+         # Podrías añadir un /last aquí
+    elif status == 'confirmation_required':
+        await processing_message.edit_text(f"⏳ {message_from_api} \nAhora necesito tu ayuda para confirmar los posibles duplicados...")
+
+        pending_list = api_result.get('pending_confirmation', [])
+        if not pending_list:
+             logger.error("API devolvió 'confirmation_required' pero lista 'pending_confirmation' vacía.")
+             await update.message.reply_text("Hubo un problema interno al procesar las confirmaciones.")
+             return
+
+        # --- Guardar estado pendiente en chat_data ---
+        # Es más seguro guardar en user_data si varios usuarios pudieran usar el bot (aunque aquí está restringido)
+        # Usaremos chat_data por simplicidad aquí asumiendo un solo usuario permitido
+        if 'pending_confirmation_details' not in context.chat_data:
+            context.chat_data['pending_confirmation_details'] = {}
+
+        # --- Enviar preguntas individuales ---
+        for pending_item in pending_list:
+            new_tx = pending_item.get('new_transaction', {})
+            existing_tx = pending_item.get('existing_match', {})
+            potential_id = new_tx.get('potential_id')
+
+            if not potential_id or not new_tx or not existing_tx:
+                 logger.warning(f"Item pendiente inválido: {pending_item}")
+                 continue
+
+            # Guardar los detalles necesarios para la inserción posterior
+            context.chat_data['pending_confirmation_details'][potential_id] = new_tx
+
+            # Formatear mensaje de pregunta
+            try:
+                 amount_new_num = new_tx.get('amount', 0.0)
+                 amount_old_num = float(existing_tx.get('amount_display', "0.0").replace(',','.'))
+                 amount_new = locale.currency(amount_new_num, grouping=True, symbol='€')
+                 amount_old = locale.currency(amount_old_num, grouping=True, symbol='€')
+            except:
+                 amount_new = f"{new_tx.get('amount_display', 'N/A')} €"
+                 amount_old = f"{existing_tx.get('amount_display', 'N/A')} €"
+
+            # --- Escapar datos dinámicos para HTML ---
+            safe_new_date = html.escape(new_tx.get('date_display', 'N/A'))
+            safe_new_desc = html.escape(new_tx.get('desc', 'N/A'))
+            safe_new_amount = html.escape(amount_new) # El formato de moneda podría tener caracteres especiales
+            safe_potential_id_short = html.escape(potential_id[:8])
+
+            safe_existing_id_short = html.escape(existing_tx.get('id', 'N/A')[:8])
+            safe_existing_date = html.escape(existing_tx.get('date_display', 'N/A'))
+            safe_existing_desc = html.escape(existing_tx.get('desc', 'N/A'))
+            safe_existing_amount = html.escape(amount_old)
+
+            # --- Construir texto con formato HTML ---
+            question_text = (
+                f"🤔 <b>Posible Duplicado</b>\n\n"
+                f"<b>Nueva Transacción:</b>\n"
+                f"  Fecha: {safe_new_date}\n"
+                f"  Desc: <code>{safe_new_desc}</code>\n"
+                f"  Importe: <b>{safe_new_amount}</b>\n"
+                f"  <i>(ID Potencial: <code>{safe_potential_id_short}...</code>)</i>\n\n" # Usamos <i> para cursiva
+                f"<b>Similar a Existente:</b>\n"
+                f"  ID: <code>{safe_existing_id_short}...</code>\n"
+                f"  Fecha: {safe_existing_date}\n"
+                f"  Desc: <code>{safe_existing_desc}</code>\n"
+                f"  Importe: <b>{safe_existing_amount}</b>\n\n"
+                f"➡️ <b>¿La NUEVA es un duplicado de la existente?</b>"
+            )
+
+            # Crear botones inline
+            keyboard = [
+                [
+                    InlineKeyboardButton("Sí (Descartar Nueva)", callback_data=f"{CALLBACK_PREFIX_CONFIRM}:discard:{potential_id}"),
+                    InlineKeyboardButton("No (Guardar Nueva)", callback_data=f"{CALLBACK_PREFIX_CONFIRM}:insert:{potential_id}"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Enviar pregunta
+            await update.message.reply_text(
+                question_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML # <-- CAMBIO IMPORTANTE
+            )
+
+# --- NUEVO Manejador de Callback Query para Confirmaciones ---
+async def handle_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja la respuesta del usuario a los botones de confirmación."""
+    query = update.callback_query
+    await query.answer() # Obligatorio responder al callback
+
+    callback_data_str = query.data
+    logger.info(f"Callback query recibido: {callback_data_str}")
+
+    try:
+        parts = callback_data_str.split(':')
+        if len(parts) != 3 or parts[0] != CALLBACK_PREFIX_CONFIRM:
+             logger.warning(f"Callback data inválida: {callback_data_str}")
+             await query.edit_message_text(text=f"Error: Callback inválido.", reply_markup=None)
+             return
+
+        action = parts[1] # 'insert' o 'discard'
+        potential_id = parts[2]
+
+        # Recuperar detalles guardados
+        pending_details = context.chat_data.get('pending_confirmation_details', {}).get(potential_id)
+
+        if not pending_details:
+            logger.error(f"No se encontraron detalles pendientes para ID {potential_id} en chat_data. ¿Bot reiniciado?")
+            await query.edit_message_text(text=f"🤔 No encuentro los detalles para confirmar {potential_id[:8]}... "
+                                                "Puede que el bot se haya reiniciado. Intenta subir el archivo de nuevo.", reply_markup=None)
+            return
+
+        # Llamar a la API de confirmación
+        api_endpoint = f"{PROCESSOR_API_URL}/confirm_transaction"
+        payload = {
+            "transaction_id": potential_id,
+            "action": action,
+            "details": pending_details # Enviar los detalles completos para 'insert'
+        }
+        confirmation_result_text = f"Error al contactar API para {action} {potential_id[:8]}..."
+
         try:
-            count = int(context.args[0])
-            if count <= 0 or count > 50:
-                await update.message.reply_text("Por favor, introduce un número entre 1 y 50.")
-                return
-        except (ValueError, IndexError):
-            await update.message.reply_text("Uso: /last [número] (ej. /last 10). Usando 5 por defecto.")
-            count = 5
-    logger.info(f"Solicitando los últimos {count} movimientos a la API.")
+            logger.info(f"Enviando confirmación a {api_endpoint}: {payload}")
+            response = requests.post(api_endpoint, json=payload, timeout=30)
+            response.raise_for_status()
+            api_response = response.json()
+            logger.info(f"Respuesta de confirmación API: {api_response}")
+
+            if api_response.get("status") == "ok":
+                 if action == "insert": confirmation_result_text = f"✅ ¡Guardado! Transacción {potential_id[:8]}... insertada."
+                 else: confirmation_result_text = f"🗑️ ¡Descartado! Transacción {potential_id[:8]}... ignorada."
+                 # Limpiar estado una vez procesado
+                 if potential_id in context.chat_data.get('pending_confirmation_details', {}):
+                     del context.chat_data['pending_confirmation_details'][potential_id]
+                     logger.debug(f"Detalles pendientes para {potential_id} eliminados de chat_data.")
+            else:
+                 confirmation_result_text = f"⚠️ La API devolvió un problema para {action} {potential_id[:8]}: {api_response.get('message', 'Error desconocido')}"
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error de red/HTTP confirmando {potential_id}: {e}")
+            confirmation_result_text = f"❌ Error de red al confirmar {action} para {potential_id[:8]}."
+        except Exception as e:
+             logger.error(f"Error inesperado confirmando {potential_id}: {e}", exc_info=True)
+             confirmation_result_text = f"🆘 Error inesperado al confirmar {action} para {potential_id[:8]}."
+
+        # Editar el mensaje original de la pregunta con el resultado
+        await query.edit_message_text(
+            text=confirmation_result_text,
+            reply_markup=None,
+            parse_mode=ParseMode.HTML # <-- CAMBIAR A HTML
+        )
+
+    except Exception as e:
+        logger.error(f"Error procesando callback query {callback_data_str}: {e}", exc_info=True)
+        try:
+            # Intentar informar al usuario en el chat si falla la edición
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Ocurrió un error procesando tu respuesta.")
+        except: pass # Evitar errores anidados
+
+# --- Manejador /last (sin cambios funcionales, pero mejor formato) ---
+async def show_last_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.message.from_user
+    if user.id != ALLOWED_USER_ID: await update.message.reply_text("No autorizado."); return
+
+    try: count = int(context.args[0]) if context.args else 5; assert 1 <= count <= 50
+    except: await update.message.reply_text("Uso: /last [1-50]. Usando 5."); count = 5
+    logger.info(f"User {user.id} solicitó /last {count}")
 
     api_endpoint = f"{PROCESSOR_API_URL}/last_transactions"
     try:
@@ -155,50 +277,49 @@ async def show_last_transactions(update: Update, context: ContextTypes.DEFAULT_T
         response.raise_for_status()
         transactions = response.json()
 
-        if not transactions:
-            await update.message.reply_text("No se encontraron transacciones recientes.")
-            return
+        if not transactions: await update.message.reply_text("No hay transacciones recientes."); return
 
-        message_lines = [f"📊 Últimos {len(transactions)} movimientos:"]
+        message_lines = [f"📊 *Últimos {len(transactions)} movimientos:*"]
         for tx in transactions:
-            try:
-                fecha = datetime.strptime(tx.get('transaction_date', ''), '%Y-%m-%d').strftime('%d/%m/%Y')
-            except ValueError: fecha = tx.get('transaction_date', 'Fecha Inv.')
-            try:
-                monto = float(tx.get('amount', 0.0))
-                importe_formateado = locale.currency(monto, grouping=True, symbol=True)
-            except (ValueError, TypeError): importe_formateado = f"{tx.get('amount', 'Importe Inv.')}"
-            desc = tx.get('description', 'Sin desc.')
-            message_lines.append(f"- {fecha}: {desc} ({importe_formateado})")
+            try: fecha = datetime.strptime(tx['transaction_date'], '%Y-%m-%d').strftime('%d/%m/%y') # Formato corto
+            except: fecha = tx.get('transaction_date', '??/??/??')
+            try: importe = locale.currency(float(tx['amount']), grouping=True, symbol='€')
+            except: importe = f"{tx.get('amount', '?')} €"
+            desc = tx.get('description', 'N/A').replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`') # Escapar Markdown
+            desc_short = desc[:50] + '...' if len(desc) > 50 else desc # Acortar descripciones largas
+            message_lines.append(f"`{fecha}` | {importe} | `{desc_short}`")
 
         final_message = "\n".join(message_lines)
-        if len(final_message) > 4096: final_message = final_message[:4090] + "\n(...)"
-        await update.message.reply_text(final_message)
+        await update.message.reply_text(final_message, parse_mode=ParseMode.MARKDOWN_V2)
 
-    except requests.exceptions.ConnectionError:
-        logger.error(f"Error de conexión en /last a {api_endpoint}")
-        await update.message.reply_text("❌ No se pudo conectar con el servicio de procesamiento.")
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout en /last esperando a {api_endpoint}")
-        await update.message.reply_text("❌ El servicio de procesamiento tardó demasiado en responder.")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error en /last solicitando a {api_endpoint}: {e}")
-        error_detail = f"(Código: {e.response.status_code})" if e.response else ""
-        await update.message.reply_text(f"❌ Ocurrió un error al obtener los datos {error_detail}.")
+        logger.error(f"Error API en /last: {e}")
+        status = f" (HTTP {e.response.status_code})" if e.response else " (Red)"
+        await update.message.reply_text(f"❌ Error obteniendo datos{status}.")
     except Exception as e:
          logger.error(f"Error inesperado en /last: {e}", exc_info=True)
-         await update.message.reply_text("❌ Ocurrió un error inesperado procesando /last.")
+         await update.message.reply_text("❌ Error inesperado procesando /last.")
 
 
+# --- Función Principal del Bot (MODIFICADA para añadir Callback Handler) ---
 def main() -> None:
-    if not BOT_TOKEN:
-        logger.critical("Error: Falta BOT_TOKEN.")
-        return
+    if not BOT_TOKEN: logger.critical("Error: Falta BOT_TOKEN."); return
+    if not ALLOWED_USER_ID: logger.critical("Error: Falta ALLOWED_USER_ID."); return # Doble check
+
     logger.info("Iniciando el bot...")
+    # Habilitar persistencia podría ser útil para chat_data, pero requiere configuración adicional
     application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.Document.ALL & filters.User(user_id=ALLOWED_USER_ID), handle_document))
-    application.add_handler(CommandHandler("last", show_last_transactions, filters=filters.User(user_id=ALLOWED_USER_ID)))
-    logger.info("Bot iniciado y escuchando...")
+
+    # Filtro combinado para usuario y tipo de mensaje
+    user_filter = filters.User(user_id=ALLOWED_USER_ID)
+
+    # Manejadores
+    application.add_handler(MessageHandler(filters.Document.ALL & user_filter, handle_document))
+    application.add_handler(CommandHandler("last", show_last_transactions, filters=user_filter))
+    # --- Añadir el manejador para los botones inline ---
+    application.add_handler(CallbackQueryHandler(handle_confirmation_callback, pattern=f"^{CALLBACK_PREFIX_CONFIRM}:"))
+
+    logger.info(f"Bot iniciado. Escuchando solo para User ID: {ALLOWED_USER_ID}...")
     application.run_polling()
     logger.info("Bot detenido.")
 
